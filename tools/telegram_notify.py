@@ -44,7 +44,7 @@ def _post_message(token: str, chat_id: str, text: str, alert_id: str) -> dict:
     """
     url = f"{_TELEGRAM_API}/bot{token}/sendMessage"
     # Telegram message limit is 4096 chars
-    truncated = text[:4000] + "\n\n_(truncated)_" if len(text) > 4000 else text
+    truncated = text[:4000] + "\n\n<i>(truncated)</i>" if len(text) > 4000 else text
     try:
         response = httpx.post(
             url,

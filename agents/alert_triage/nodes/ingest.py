@@ -5,6 +5,7 @@ Produces: account_id, region, alert_id, alarm_name, alarm_arn,
 """
 
 import time
+import os
 
 import structlog
 
@@ -23,7 +24,8 @@ def ingest_alert(state: AlertTriageState) -> dict:
     event = _unwrap_event(payload)
 
     account_id = event.get("account", "unknown")
-    region = event.get("region", "unknown")
+    # Region source of truth: environment configuration first, event payload fallback.
+    region = os.environ.get("AWS_DEFAULT_REGION", "").strip() or event.get("region", "unknown")
     detail = event.get("detail", {})
     alarm_name = detail.get("alarmName", "unknown-alarm")
     alarm_arn = detail.get("alarmArn", "")

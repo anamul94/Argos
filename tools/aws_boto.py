@@ -113,6 +113,9 @@ ALLOWED_COMMANDS: dict[str, set[str]] = {
         "describe_stack_events",
         "list_stacks",
     },
+    "cloudtrail": {
+        "lookup_events",
+    },
     "sns": {
         "publish",
         "list_topics",

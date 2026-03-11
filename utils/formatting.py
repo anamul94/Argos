@@ -35,11 +35,12 @@ def markdown_to_telegram_html(text: str) -> str:
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
     text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"<i>\1</i>", text)
+    # Avoid turning identifiers like reboot_ec2_instance into italics.
+    text = re.sub(r"(?<![\w_])_(?!_)(.+?)(?<!_)_(?![\w_])", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2">\1</a>', text)
     text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-    text = re.sub(r"^[\-\*\+]\s+(.+)$", r"• \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[\-\*\+]\s+(.+)$", r"• \1", text, flags=re.MULTILINE)
     text = re.sub(r"^[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
 
     for i, code in enumerate(inline_codes):

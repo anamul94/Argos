@@ -44,6 +44,26 @@ Use the write_todos tool to plan your remediation steps before executing anythin
 - If no safe action can help, call no_action and explain why manual intervention is needed.
 - Never skip verification after an action."""
 
+_NOT_FOUND_ERROR_CODES = {
+    "InvalidInstanceID.NotFound",
+    "DBInstanceNotFound",
+    "CacheClusterNotFound",
+    "AutoScalingGroupNotFound",
+    "ServiceNotFoundException",
+    "ClusterNotFoundException",
+    "ResourceNotFoundException",
+    "TargetGroupNotFound",
+}
+_NOT_FOUND_ERROR_HINTS = (
+    "not found",
+    "does not exist",
+    "cannot be found",
+    "resource not found",
+    "no such",
+    "deleted",
+    "terminated",
+)
+
 
 def remediate_agent(state: AlertTriageState) -> dict:
     """ReAct remediation agent with TodoListMiddleware for structured multi-step execution."""
@@ -127,7 +147,16 @@ def _determine_resolved(tool_results: list[dict]) -> bool:
 
 
 def _extract_actions_taken(tool_results: list[dict]) -> list[str]:
-    return [f"{tr['tool']}: {str(tr['result'])[:120]}" for tr in tool_results]
+    actions = []
+    for tr in tool_results:
+        raw = str(tr["result"])
+        parsed = _parse_result_json(raw)
+        if parsed and parsed.get("resource_missing_or_deleted"):
+            code = parsed.get("error_code", "unknown")
+            actions.append(f"{tr['tool']}: resource not found or deleted ({code})")
+        else:
+            actions.append(f"{tr['tool']}: {raw[:120]}")
+    return actions
 
 
 def _get_final_summary(messages: list) -> str:
@@ -146,6 +175,22 @@ def _summarise_action_type(tool_results: list[dict]) -> str:
     return ", ".join(actions) if actions else "no_action"
 
 
+def _parse_result_json(raw: str) -> dict | None:
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _is_resource_missing_or_deleted(result: dict) -> bool:
+    error_code = str(result.get("error_code", "")).strip()
+    error_text = str(result.get("error", "")).lower()
+    if error_code in _NOT_FOUND_ERROR_CODES:
+        return True
+    return any(hint in error_text for hint in _NOT_FOUND_ERROR_HINTS)
+
+
 # ── Remediation tools (closures — resource IDs from state dimensions only) ────
 
 def _build_remediation_tools(state: AlertTriageState) -> list:
@@ -158,6 +203,15 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
     service_health = state.get("service_health", {})
     region = state["region"]
     service_type = state.get("service_type", "unknown")
+
+    def _action_response(action: str, boto_result: dict, **details) -> str:
+        payload: dict = {"action": action, "status": boto_result.get("status"), **details}
+        if boto_result.get("status") != "ok":
+            payload["error_code"] = boto_result.get("error_code")
+            payload["error"] = boto_result.get("error")
+            if _is_resource_missing_or_deleted(boto_result):
+                payload["resource_missing_or_deleted"] = True
+        return json.dumps(payload, default=str)
 
     @tool
     def force_ecs_redeploy() -> str:
@@ -173,8 +227,7 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             {"cluster": cluster, "service": service, "forceNewDeployment": True},
             region,
         )
-        return json.dumps({"action": "force_ecs_redeploy", "cluster": cluster,
-                           "service": service, "status": result.get("status")}, default=str)
+        return _action_response("force_ecs_redeploy", result, cluster=cluster, service=service)
 
     @tool
     def scale_out_ecs() -> str:
@@ -192,8 +245,7 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             {"cluster": cluster, "service": service, "desiredCount": new_count},
             region,
         )
-        return json.dumps({"action": "scale_out_ecs", "old_count": current,
-                           "new_count": new_count, "status": result.get("status")}, default=str)
+        return _action_response("scale_out_ecs", result, old_count=current, new_count=new_count)
 
     @tool
     def start_ec2_instance() -> str:
@@ -205,8 +257,7 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
         if not instance_id:
             return json.dumps({"status": "error", "error": "InstanceId not in alarm dimensions"})
         result = run_boto_sync("ec2", "start_instances", {"InstanceIds": [instance_id]}, region)
-        return json.dumps({"action": "start_ec2", "instance_id": instance_id,
-                           "status": result.get("status")}, default=str)
+        return _action_response("start_ec2", result, instance_id=instance_id)
 
     @tool
     def reboot_ec2_instance() -> str:
@@ -218,8 +269,7 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
         if not instance_id:
             return json.dumps({"status": "error", "error": "InstanceId not in alarm dimensions"})
         result = run_boto_sync("ec2", "reboot_instances", {"InstanceIds": [instance_id]}, region)
-        return json.dumps({"action": "reboot_ec2", "instance_id": instance_id,
-                           "status": result.get("status")}, default=str)
+        return _action_response("reboot_ec2", result, instance_id=instance_id)
 
     @tool
     def reboot_rds_instance() -> str:
@@ -230,8 +280,7 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
         if not db_id:
             return json.dumps({"status": "error", "error": "DBInstanceIdentifier not in alarm dimensions"})
         result = run_boto_sync("rds", "reboot_db_instance", {"DBInstanceIdentifier": db_id}, region)
-        return json.dumps({"action": "reboot_rds", "db_id": db_id,
-                           "status": result.get("status")}, default=str)
+        return _action_response("reboot_rds", result, db_id=db_id)
 
     @tool
     def scale_out_asg() -> str:
@@ -247,8 +296,7 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             {"AutoScalingGroupName": asg_name, "DesiredCapacity": current + 2},
             region,
         )
-        return json.dumps({"action": "scale_out_asg", "asg": asg_name,
-                           "new_capacity": current + 2, "status": result.get("status")}, default=str)
+        return _action_response("scale_out_asg", result, asg=asg_name, new_capacity=current + 2)
 
     @tool
     def reboot_elasticache_cluster() -> str:
@@ -263,8 +311,7 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             {"CacheClusterId": cluster_id, "CacheNodeIdsToReboot": ["0001"]},
             region,
         )
-        return json.dumps({"action": "reboot_elasticache", "cluster_id": cluster_id,
-                           "status": result.get("status")}, default=str)
+        return _action_response("reboot_elasticache", result, cluster_id=cluster_id)
 
     @tool
     def verify_service_health() -> str:
@@ -284,6 +331,15 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             if cluster and service_name:
                 result = run_boto_sync("ecs", "describe_services",
                                        {"cluster": cluster, "services": [service_name]}, region)
+                if result.get("status") != "ok":
+                    health = {
+                        "status": result.get("status"),
+                        "error_code": result.get("error_code"),
+                        "error": result.get("error"),
+                    }
+                    if _is_resource_missing_or_deleted(result):
+                        health["resource_missing_or_deleted"] = True
+                    return json.dumps({"resolved": False, "health": health}, default=str)
                 svc = (result.get("data", {}).get("Services") or [{}])[0]
                 desired = svc.get("desiredCount", 0)
                 running = svc.get("runningCount", 0)
@@ -295,6 +351,15 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             if db_id:
                 result = run_boto_sync("rds", "describe_db_instances",
                                        {"DBInstanceIdentifier": db_id}, region)
+                if result.get("status") != "ok":
+                    health = {
+                        "status": result.get("status"),
+                        "error_code": result.get("error_code"),
+                        "error": result.get("error"),
+                    }
+                    if _is_resource_missing_or_deleted(result):
+                        health["resource_missing_or_deleted"] = True
+                    return json.dumps({"resolved": False, "health": health}, default=str)
                 instances = result.get("data", {}).get("DBInstances") or [{}]
                 status = instances[0].get("DBInstanceStatus", "unknown")
                 health = {"status": status}
@@ -305,6 +370,15 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             if instance_id:
                 result = run_boto_sync("ec2", "describe_instance_status",
                                        {"InstanceIds": [instance_id], "IncludeAllInstances": True}, region)
+                if result.get("status") != "ok":
+                    health = {
+                        "status": result.get("status"),
+                        "error_code": result.get("error_code"),
+                        "error": result.get("error"),
+                    }
+                    if _is_resource_missing_or_deleted(result):
+                        health["resource_missing_or_deleted"] = True
+                    return json.dumps({"resolved": False, "health": health}, default=str)
                 statuses = result.get("data", {}).get("InstanceStatuses") or [{}]
                 state_info = statuses[0]
                 instance_state = state_info.get("InstanceState", {}).get("Name", "unknown")
@@ -319,6 +393,15 @@ def _build_remediation_tools(state: AlertTriageState) -> list:
             if cluster_id:
                 result = run_boto_sync("elasticache", "describe_cache_clusters",
                                        {"CacheClusterId": cluster_id, "ShowCacheNodeInfo": True}, region)
+                if result.get("status") != "ok":
+                    health = {
+                        "status": result.get("status"),
+                        "error_code": result.get("error_code"),
+                        "error": result.get("error"),
+                    }
+                    if _is_resource_missing_or_deleted(result):
+                        health["resource_missing_or_deleted"] = True
+                    return json.dumps({"resolved": False, "health": health}, default=str)
                 cluster = (result.get("data", {}).get("CacheClusters") or [{}])[0]
                 cluster_status = cluster.get("CacheClusterStatus", "unknown")
                 health = {"status": cluster_status}

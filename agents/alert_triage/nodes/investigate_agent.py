@@ -43,6 +43,10 @@ Use the write_todos tool to plan your investigation before executing any steps.
   - If no metadata is provided, use the `list_log_groups` tool with a prefix like `/argos/`, `/aws/ecs/` or `/aws/lambda/` to discover the exact name securely. Do not guess.
 - If logs or metrics point to a dependency issue (e.g., "connection refused to postgres"),
   add a new todo and investigate that service too.
+- If AWS APIs show "not found", "does not exist", or terminated/missing resources,
+  use CloudTrail lookup to check recent change events (delete/terminate/stop) for that resource.
+- For EC2 alerts where the instance is stopped/terminated/unreachable, use
+  check_ec2_stop_cause to determine likely cause (manual/API vs platform/system).
 - Stop when you can state the root cause with confidence.
 - End with a clear summary: root cause, confidence (high/medium/low), contributing factors."""
 
@@ -297,6 +301,101 @@ def _build_investigation_tools(region: str) -> list:
         }, default=str)
 
     @tool
+    def check_ec2_stop_cause(instance_id: str, max_events: int = 20) -> str:
+        """Determine likely cause of an EC2 stop/termination using state reason + CloudTrail.
+
+        Returns probable cause with evidence:
+        - manual_or_automation_action (API/user/role via CloudTrail)
+        - instance_initiated_shutdown_or_os_level
+        - platform_or_unknown
+        """
+        desc = run_boto_sync("ec2", "describe_instances", {"InstanceIds": [instance_id]}, region)
+        status = run_boto_sync(
+            "ec2",
+            "describe_instance_status",
+            {"InstanceIds": [instance_id], "IncludeAllInstances": True},
+            region,
+        )
+        trail = run_boto_sync(
+            "cloudtrail",
+            "lookup_events",
+            {
+                "LookupAttributes": [
+                    {"AttributeKey": "ResourceName", "AttributeValue": instance_id}
+                ],
+                "MaxResults": max(1, min(max_events, 25)),
+            },
+            region,
+        )
+
+        if desc.get("status") != "ok":
+            return json.dumps(
+                {"status": desc.get("status"), "error_code": desc.get("error_code"), "error": desc.get("error")},
+                default=str
+            )
+
+        reservations = desc.get("data", {}).get("Reservations", [])
+        instances = reservations[0].get("Instances", []) if reservations else []
+        instance = instances[0] if instances else {}
+        state_name = instance.get("State", {}).get("Name", "unknown")
+        state_reason = instance.get("StateReason", {}).get("Message", "")
+        transition_reason = instance.get("StateTransitionReason", "")
+
+        # Pull health checks where available.
+        status_items = status.get("data", {}).get("InstanceStatuses", []) if status.get("status") == "ok" else []
+        status_item = status_items[0] if status_items else {}
+        instance_status = status_item.get("InstanceStatus", {}).get("Status", "unknown")
+        system_status = status_item.get("SystemStatus", {}).get("Status", "unknown")
+
+        trail_events = []
+        actor = None
+        matched_event = None
+        if trail.get("status") == "ok":
+            for event in trail.get("data", {}).get("Events", [])[:25]:
+                name = event.get("EventName")
+                entry = {
+                    "time": event.get("EventTime"),
+                    "event": name,
+                    "source": event.get("EventSource"),
+                    "username": event.get("Username"),
+                }
+                trail_events.append(entry)
+                if not matched_event and name in {"StopInstances", "TerminateInstances", "StartInstances", "RebootInstances"}:
+                    matched_event = entry
+                    actor = event.get("Username")
+
+        probable_cause = "platform_or_unknown"
+        confidence = "low"
+        reason_blob = f"{state_reason} {transition_reason}".lower()
+        if matched_event:
+            probable_cause = "manual_or_automation_action"
+            confidence = "high"
+        elif "client.userinitiatedshutdown" in reason_blob:
+            probable_cause = "instance_initiated_shutdown_or_os_level"
+            confidence = "medium"
+        elif "server." in reason_blob:
+            probable_cause = "platform_or_host_level"
+            confidence = "medium"
+        elif state_name in {"stopped", "terminated"}:
+            probable_cause = "stopped_or_terminated_cause_unclear"
+            confidence = "low"
+
+        return json.dumps({
+            "status": "ok",
+            "instance_id": instance_id,
+            "state": state_name,
+            "state_reason": state_reason,
+            "state_transition_reason": transition_reason,
+            "instance_status": instance_status,
+            "system_status": system_status,
+            "probable_cause": probable_cause,
+            "confidence": confidence,
+            "actor": actor,
+            "matched_cloudtrail_event": matched_event,
+            "recent_cloudtrail_events": trail_events[:10],
+        }, default=str)[:3500]
+
+    @tool
     def check_rds_health(db_instance_id: str) -> str:
         """Get RDS DB instance status, engine version, and recent events.
 
@@ -371,6 +470,42 @@ def _build_investigation_tools(region: str) -> list:
             "node_statuses": [n.get("CacheNodeStatus") for n in cluster.get("CacheNodes", [])],
         }, default=str)
 
+    @tool
+    def lookup_resource_change_events(resource_name: str, max_events: int = 10) -> str:
+        """Lookup recent CloudTrail management events for a resource name.
+
+        Use this when a resource appears deleted, terminated, or not found to
+        understand what action happened and who/what initiated it.
+        """
+        result = run_boto_sync(
+            "cloudtrail",
+            "lookup_events",
+            {
+                "LookupAttributes": [
+                    {"AttributeKey": "ResourceName", "AttributeValue": resource_name}
+                ],
+                "MaxResults": max(1, min(max_events, 25)),
+            },
+            region,
+        )
+        if result.get("status") != "ok":
+            return json.dumps(
+                {"status": result.get("status"), "error_code": result.get("error_code"), "error": result.get("error")},
+                default=str
+            )
+
+        events = result.get("data", {}).get("Events", [])
+        compact = []
+        for e in events[:25]:
+            compact.append({
+                "time": e.get("EventTime"),
+                "event": e.get("EventName"),
+                "source": e.get("EventSource"),
+                "username": e.get("Username"),
+                "event_id": e.get("EventId"),
+            })
+        return json.dumps({"status": "ok", "events": compact}, default=str)[:3000]
+
     return [
         get_metric_data,
         get_alarm_history,
@@ -378,8 +513,10 @@ def _build_investigation_tools(region: str) -> list:
         search_logs,
         check_ecs_health,
         check_ec2_health,
+        check_ec2_stop_cause,
         check_rds_health,
         check_lambda_health,
         check_alb_health,
         check_elasticache_health,
+        lookup_resource_change_events,
     ]

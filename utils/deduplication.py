@@ -68,11 +68,13 @@ def is_duplicate(alarm_arn: str, state_timestamp: str, alert_id: str) -> bool:
 def mark_processing(alarm_arn: str, state_timestamp: str, alert_id: str) -> None:
     """Record this alarm event as being processed.
 
-    Uses a conditional write so only one concurrent process wins.
+    Uses a conditional write on the exact event key so only one concurrent
+    process wins. Flapping cooldown is intentionally NOT set here; it is set
+    only after successful triage in mark_completed().
+
     Raises DuplicateAlertError if another process beat us to it.
     """
     exact_key = f"exact#{alarm_arn}#{state_timestamp}"
-    flap_key = f"flap#{alarm_arn}"
     now = int(time.time())
 
     try:
@@ -83,13 +85,6 @@ def mark_processing(alarm_arn: str, state_timestamp: str, alert_id: str) -> None
             ttl=now + 3600,          # exact dedup: 1 hour is plenty
             alert_id=alert_id,
             conditional=True,        # raises if already exists
-        )
-        _put_with_ttl(
-            table=table,
-            dedup_key=flap_key,
-            ttl=now + _FLAP_COOLDOWN_SECONDS,
-            alert_id=alert_id,
-            conditional=False,       # overwrite — reset the cooldown window
         )
         log.debug("dedup_marked_processing", alert_id=alert_id, alarm_arn=alarm_arn)
 
@@ -102,7 +97,7 @@ def mark_processing(alarm_arn: str, state_timestamp: str, alert_id: str) -> None
 
 
 def mark_completed(alarm_arn: str, alert_id: str) -> None:
-    """Reset the flapping cooldown after a successful triage.
+    """Set the flapping cooldown after a successful triage.
 
     Keeps the cooldown active so rapid re-alarms are still suppressed,
     but updates the alert_id so logs show the latest run.

@@ -7,7 +7,6 @@ Routes:
 
 import asyncio
 import json
-from datetime import datetime
 
 import structlog
 from dotenv import load_dotenv
@@ -96,50 +95,93 @@ async def alert_webhook(req: Request, background_tasks: BackgroundTasks) -> dict
     """
     try:
         payload = await req.json()
-        print(payload)
-        # with open("log.txt", "a") as f:
-        #     f.write(f"{datetime.now()} {json.dumps(payload)}\n")
     except Exception as e:
         log.error("alert_webhook_bad_payload", error=str(e))
         return {"ok": False, "error": "Invalid JSON payload"}
 
-    if not _is_cloudwatch_alarm_event(payload):
+    event = _extract_cloudwatch_alarm_event(payload)
+    if not event:
         log.warning("alert_webhook_unexpected_payload",
                     source=payload.get("source"), detail_type=payload.get("detail-type"))
         return {"ok": True, "status": "ignored", "reason": "Not a CloudWatch alarm event"}
 
-    log.info("alert_webhook_received",
-             alarm_name=payload.get("detail", {}).get("alarmName", "unknown"),
-             account=payload.get("account", "unknown"))
+    if not _is_cloudwatch_alarm_event(event):
+        log.info(
+            "alert_webhook_ignored_non_alarm_state",
+            alarm_name=event.get("detail", {}).get("alarmName", "unknown"),
+            state=event.get("detail", {}).get("state", {}).get("value", "unknown"),
+        )
+        return {"ok": True, "status": "ignored", "reason": "CloudWatch event state is not ALARM"}
 
-    background_tasks.add_task(_run_triage, payload)
+    log.info("alert_webhook_received",
+             alarm_name=event.get("detail", {}).get("alarmName", "unknown"),
+             account=event.get("account", "unknown"))
+
+    background_tasks.add_task(_run_triage, event)
     return {"ok": True, "status": "processing"}
 
 
-def _is_cloudwatch_alarm_event(payload: dict) -> bool:
-    """Return True if the payload is a CloudWatch Alarm State Change event."""
-    # Direct EventBridge event
-    if (payload.get("source") == "aws.cloudwatch"
-            and payload.get("detail-type") == "CloudWatch Alarm State Change"):
-        return True
-    # SQS-wrapped EventBridge event
-    if "Records" in payload:
+def _extract_cloudwatch_alarm_event(payload: dict) -> dict | None:
+    """Return a normalized CloudWatch Alarm State Change event from direct or SQS-wrapped payloads."""
+    if not isinstance(payload, dict):
+        return None
+
+    if _is_cloudwatch_event_shape(payload):
+        return payload
+
+    records = payload.get("Records", [])
+    if not isinstance(records, list):
+        return None
+
+    for record in records:
+        body = record.get("body", {})
+        event = _parse_json_maybe(body)
+        if not isinstance(event, dict):
+            continue
+
+        # Handles SNS->SQS wrappers where the actual event is in Message.
+        if "Message" in event:
+            message = _parse_json_maybe(event.get("Message", {}))
+            if isinstance(message, dict):
+                event = message
+
+        if _is_cloudwatch_event_shape(event):
+            return event
+
+    return None
+
+
+def _parse_json_maybe(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
         try:
-            body = json.loads(payload["Records"][0].get("body", "{}"))
-            return (body.get("source") == "aws.cloudwatch"
-                    and body.get("detail-type") == "CloudWatch Alarm State Change")
+            return json.loads(value)
         except Exception:
-            return False
-    return False
+            return None
+    return None
 
 
-def _run_triage(payload: dict) -> None:
+def _is_cloudwatch_event_shape(event: dict) -> bool:
+    return (
+        event.get("source") == "aws.cloudwatch"
+        and event.get("detail-type") == "CloudWatch Alarm State Change"
+        and isinstance(event.get("detail"), dict)
+    )
+
+
+def _is_cloudwatch_alarm_event(event: dict) -> bool:
+    """Return True only for ALARM state transitions of CloudWatch Alarm State Change events."""
+    return _is_cloudwatch_event_shape(event) and event.get("detail", {}).get("state", {}).get("value") == "ALARM"
+
+
+def _run_triage(event: dict) -> None:
     """Invoke the alert triage graph synchronously (runs in background thread)."""
     import time
     from utils.deduplication import DuplicateAlertError, is_duplicate, mark_completed, mark_processing
 
-    detail = payload.get("detail", {})
-    account_id = payload.get("account", "unknown")
+    detail = event.get("detail", {})
+    account_id = event.get("account", "unknown")
     alarm_name = detail.get("alarmName", "unknown")
     alarm_arn = detail.get("alarmArn", alarm_name)
     state_timestamp = detail.get("state", {}).get("timestamp", "")
@@ -157,7 +199,7 @@ def _run_triage(payload: dict) -> None:
 
     # ── Run graph ─────────────────────────────────────────────────────────────
     config = build_thread_config(account_id=account_id, alert_id=alert_id)
-    initial_state = build_initial_state(raw_payload=payload)
+    initial_state = build_initial_state(raw_payload=event)
 
     log.info("triage_graph_starting", alert_id=alert_id, alarm_name=alarm_name)
     try:
