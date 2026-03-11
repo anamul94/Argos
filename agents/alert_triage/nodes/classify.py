@@ -16,6 +16,7 @@ import structlog
 from pydantic import BaseModel, Field
 
 from models.alert_state import AlertTriageState
+from utils.token_usage import build_node_usage, merge_node_usage
 
 log = structlog.get_logger(__name__)
 
@@ -63,6 +64,11 @@ def classify_alert(state: AlertTriageState) -> dict:
     service_type = _NAMESPACE_MAP.get(metric_namespace, "unknown")
     affected_resources = _build_affected_resources(dimensions=dimensions, account_id=state["account_id"])
     metadata = state["raw_payload"].get("customMetadata", {})
+    token_usage_metadata = merge_node_usage(
+        state.get("token_usage_metadata"),
+        "classify_alert",
+        build_node_usage(model_name="none"),
+    )
 
     log.info(
         "alert_classified",
@@ -81,6 +87,7 @@ def classify_alert(state: AlertTriageState) -> dict:
         "metric_name": metric_name,
         "dimensions": dimensions,
         "metadata": metadata,
+        "token_usage_metadata": token_usage_metadata,
         "affected_resources": affected_resources,
         "actions_taken": [
             f"[classify_alert] severity={severity}, service={service_type}, "

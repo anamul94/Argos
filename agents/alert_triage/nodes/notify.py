@@ -12,6 +12,7 @@ from models.alert_state import AlertTriageState
 from tools.jira import create_jira_issue
 from tools.sns_notify import send_sms
 from tools.telegram_notify import send_ops_alert
+from utils.token_usage import build_node_usage, merge_node_usage
 
 log = structlog.get_logger(__name__)
 
@@ -47,10 +48,25 @@ def notify_and_report(state: AlertTriageState) -> dict:
     jira_result = _create_ticket(state)
     jira_key = jira_result.get("issue_key")
 
-    telegram_result = _send_telegram(state=state, jira_key=jira_key)
-    sms_result = _send_sms_if_p1(state=state)
+    notify_tool_calls_by_name = {
+        "create_jira_issue": 1,
+        "send_ops_alert": 1,
+        "send_sms": 1 if severity.lower() == "p1" else 0,
+    }
+    token_usage_metadata = merge_node_usage(
+        state.get("token_usage_metadata"),
+        "notify_and_report",
+        build_node_usage(
+            model_name="none",
+            tool_calls=sum(notify_tool_calls_by_name.values()),
+            tool_calls_by_name=notify_tool_calls_by_name,
+        ),
+    )
 
-    report = _build_report(state=state, jira_key=jira_key)
+    telegram_result = _send_telegram(state=state, jira_key=jira_key, token_usage_metadata=token_usage_metadata)
+    sms_result = _send_sms_if_p1(state=state, token_usage_metadata=token_usage_metadata)
+
+    report = _build_report(state=state, jira_key=jira_key, token_usage_metadata=token_usage_metadata)
 
     log.info("notify_and_report_complete", alert_id=alert_id, jira_key=jira_key,
              telegram_ok=telegram_result.get("status") == "ok",
@@ -60,6 +76,7 @@ def notify_and_report(state: AlertTriageState) -> dict:
         "jira_issue_key": jira_key,
         "telegram_sent": telegram_result.get("status") == "ok",
         "sms_sent": sms_result is not None and sms_result.get("status") == "ok",
+        "token_usage_metadata": token_usage_metadata,
         "report": report,
         "actions_taken": [
             f"[notify_and_report] Jira: {jira_key or 'failed'} | "
@@ -89,9 +106,9 @@ def _create_ticket(state: AlertTriageState) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-def _send_telegram(state: AlertTriageState, jira_key: str | None) -> dict:
+def _send_telegram(state: AlertTriageState, jira_key: str | None, token_usage_metadata: dict) -> dict:
     """Send a formatted alert summary to the Telegram ops channel."""
-    text = _build_telegram_message(state=state, jira_key=jira_key)
+    text = _build_telegram_message(state=state, jira_key=jira_key, token_usage_metadata=token_usage_metadata)
     try:
         return send_ops_alert(text=text, alert_id=state["alert_id"])
     except Exception as e:
@@ -99,15 +116,21 @@ def _send_telegram(state: AlertTriageState, jira_key: str | None) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-def _send_sms_if_p1(state: AlertTriageState) -> dict | None:
+def _send_sms_if_p1(state: AlertTriageState, token_usage_metadata: dict) -> dict | None:
     """Send SMS to on-call only for P1 alerts. Returns None for non-P1."""
     if state.get("severity", "").lower() != "p1":
         return None
+    totals = token_usage_metadata.get("totals", {}) if isinstance(token_usage_metadata, dict) else {}
+    per_node_summary = _build_token_usage_sms_line(token_usage_metadata)
     message = (
         f"[ARGOS P1 ALERT] {state['alarm_name']}\n"
         f"Account: {state['account_id']} | {state['region']}\n"
         f"Root cause: {state.get('root_cause', 'Unknown')[:200]}\n"
         f"Resolved: {state.get('resolved', False)}\n"
+        f"Tokens in/out/total: {totals.get('input_tokens', 0)}/{totals.get('output_tokens', 0)}/{totals.get('total_tokens', 0)}\n"
+        f"Token cost in/out/total USD: {totals.get('total_input_token_cost_usd', 0.0):.6f}/{totals.get('total_output_token_cost_usd', 0.0):.6f}/{totals.get('total_token_cost_usd', 0.0):.6f}\n"
+        f"Tool calls: {totals.get('tool_calls', 0)}\n"
+        f"Node usage: {per_node_summary}\n"
         f"Alert ID: {state['alert_id']}"
     )
     try:
@@ -117,7 +140,7 @@ def _send_sms_if_p1(state: AlertTriageState) -> dict | None:
         return {"status": "error", "error": str(e)}
 
 
-def _build_telegram_message(state: AlertTriageState, jira_key: str | None) -> str:
+def _build_telegram_message(state: AlertTriageState, jira_key: str | None, token_usage_metadata: dict) -> str:
     """Build the Telegram ops alert message in Markdown."""
     resolved_label = "RESOLVED" if state.get("resolved") else "OPEN"
     severity = state.get("severity", "??").upper()
@@ -158,6 +181,7 @@ def _build_telegram_message(state: AlertTriageState, jira_key: str | None) -> st
     body += (
         f"**Actions Taken by Argos**\n{actions}\n\n"
         f"**Contributing Factors**\n{factors}\n\n"
+        f"**Token Usage Metadata**\n{_build_token_usage_markdown(token_usage_metadata)}\n\n"
         f"---\n"
     )
     return header + body
@@ -178,7 +202,7 @@ def _limit_line(text: str, max_len: int) -> str:
     return text[: max_len - 3].rstrip() + "..."
 
 
-def _build_report(state: AlertTriageState, jira_key: str | None) -> dict:
+def _build_report(state: AlertTriageState, jira_key: str | None, token_usage_metadata: dict) -> dict:
     """Build the final structured report stored in state for audit purposes."""
     resource_issue = _detect_resource_missing_or_deleted(state)
     resource_evidence = _collect_resource_issue_evidence(state)
@@ -198,9 +222,84 @@ def _build_report(state: AlertTriageState, jira_key: str | None) -> dict:
         "jira_issue_key": jira_key,
         "actions_taken": state.get("actions_taken", []),
         "node_errors": state.get("node_errors", []),
+        "token_usage_metadata": token_usage_metadata,
         "resource_missing_or_deleted": resource_issue,
         "resource_issue_evidence": resource_evidence,
     }
+
+
+def _build_token_usage_markdown(token_usage_metadata: dict) -> str:
+    """Build a compact fixed-width table for Telegram-friendly token usage output."""
+    if not isinstance(token_usage_metadata, dict):
+        return "- No usage metadata available"
+
+    totals = token_usage_metadata.get("totals", {}) if isinstance(token_usage_metadata.get("totals"), dict) else {}
+    nodes = token_usage_metadata.get("nodes", {}) if isinstance(token_usage_metadata.get("nodes"), dict) else {}
+
+    headers = ("Node", "Model", "In", "Out", "Total", "Tools", "In$", "Out$", "Tot$")
+    rows: list[tuple[str, str, str, str, str, str, str, str, str]] = [
+        (
+            "TOTAL",
+            "-",
+            str(totals.get("input_tokens", 0)),
+            str(totals.get("output_tokens", 0)),
+            str(totals.get("total_tokens", 0)),
+            str(totals.get("tool_calls", 0)),
+            f"{totals.get('total_input_token_cost_usd', 0.0):.6f}",
+            f"{totals.get('total_output_token_cost_usd', 0.0):.6f}",
+            f"{totals.get('total_token_cost_usd', 0.0):.6f}",
+        )
+    ]
+
+    for node_name in sorted(nodes.keys()):
+        usage = nodes.get(node_name, {}) if isinstance(nodes.get(node_name), dict) else {}
+        rows.append(
+            (
+                _truncate(node_name, 18),
+                _truncate(str(usage.get("model_name", "unknown")), 24),
+                str(usage.get("input_tokens", 0)),
+                str(usage.get("output_tokens", 0)),
+                str(usage.get("total_tokens", 0)),
+                str(usage.get("tool_calls", 0)),
+                f"{usage.get('input_token_cost_usd', 0.0):.6f}",
+                f"{usage.get('output_token_cost_usd', 0.0):.6f}",
+                f"{usage.get('total_token_cost_usd', 0.0):.6f}",
+            )
+        )
+
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, value in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(value))
+
+    def _fmt(row: tuple[str, str, str, str, str, str, str, str, str]) -> str:
+        return " | ".join(value.ljust(col_widths[i]) for i, value in enumerate(row))
+
+    separator = "-+-".join("-" * w for w in col_widths)
+    table_lines = [_fmt(headers), separator] + [_fmt(r) for r in rows]
+    return "```text\n" + "\n".join(table_lines) + "\n```"
+
+
+def _build_token_usage_sms_line(token_usage_metadata: dict) -> str:
+    """Build a compact single-line node usage summary for SMS."""
+    if not isinstance(token_usage_metadata, dict):
+        return "n/a"
+    nodes = token_usage_metadata.get("nodes", {}) if isinstance(token_usage_metadata.get("nodes"), dict) else {}
+    parts: list[str] = []
+    for node_name in sorted(nodes.keys()):
+        usage = nodes.get(node_name, {}) if isinstance(nodes.get(node_name), dict) else {}
+        parts.append(
+            f"{node_name}:{usage.get('input_tokens', 0)}/{usage.get('output_tokens', 0)}/{usage.get('total_tokens', 0)}"
+            f",t{usage.get('tool_calls', 0)},m={usage.get('model_name', 'unknown')}"
+        )
+    summary = " | ".join(parts)
+    return _limit_line(summary, 600)
+
+
+def _truncate(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3] + "..."
 
 
 def _detect_resource_missing_or_deleted(state: AlertTriageState) -> bool:

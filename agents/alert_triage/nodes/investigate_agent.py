@@ -14,6 +14,7 @@ All tools are read-only AWS operations — no writes happen here.
 """
 
 import json
+import os
 import time
 
 import structlog
@@ -27,6 +28,12 @@ from pydantic import BaseModel, Field
 from models.alert_state import AlertTriageState
 from tools.aws_boto import run_boto_sync
 from utils.llm import get_bedrock_llm
+from utils.token_usage import (
+    build_node_usage,
+    count_tool_calls_by_name,
+    extract_token_usage_from_messages,
+    merge_node_usage,
+)
 
 load_dotenv()
 
@@ -62,6 +69,7 @@ def investigate_agent(state: AlertTriageState) -> dict:
     """ReAct investigation agent with TodoListMiddleware for structured planning."""
     alert_id = state["alert_id"]
     region = state["region"]
+    fallback_model = os.environ.get("BEDROCK_MODEL_ID", "unknown").removeprefix("bedrock:")
     log.info("investigate_agent_started", alert_id=alert_id, service=state["service_type"])
 
     investigation_tools = _build_investigation_tools(region)
@@ -80,10 +88,24 @@ def investigate_agent(state: AlertTriageState) -> dict:
     try:
         result = agent.invoke({"messages": [HumanMessage(content=_build_initial_message(state))]})
         messages = result.get("messages", [])
-        tool_calls_made = sum(1 for m in messages if hasattr(m, "tool_calls") and m.tool_calls)
+        tool_results = _extract_tool_results(messages, include_todos=True)
+        tool_calls_made, tool_calls_by_name = count_tool_calls_by_name(tool_results)
+        input_tokens, output_tokens, total_tokens, model_name = extract_token_usage_from_messages(
+            messages,
+            fallback_model_name=fallback_model,
+        )
+        node_usage = build_node_usage(
+            model_name=model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            tool_calls=tool_calls_made,
+            tool_calls_by_name=tool_calls_by_name,
+        )
         analysis = _synthesise_rca(state, messages)
         log.info("investigate_agent_complete", alert_id=alert_id,
-                 confidence=analysis.confidence, tool_calls=tool_calls_made)
+                 confidence=analysis.confidence, tool_calls=tool_calls_made,
+                 input_tokens=input_tokens, output_tokens=output_tokens, model_name=model_name)
     except Exception as e:
         log.error("investigate_agent_failed", alert_id=alert_id, error=str(e))
         analysis = RootCauseAnalysis(
@@ -93,11 +115,19 @@ def investigate_agent(state: AlertTriageState) -> dict:
             reasoning="Investigation agent encountered an unexpected error.",
         )
         tool_calls_made = 0
+        node_usage = build_node_usage(model_name=fallback_model)
+
+    token_usage_metadata = merge_node_usage(
+        state.get("token_usage_metadata"),
+        "investigate_agent",
+        node_usage,
+    )
 
     return {
         "root_cause": analysis.root_cause,
         "confidence": analysis.confidence,
         "contributing_factors": analysis.contributing_factors,
+        "token_usage_metadata": token_usage_metadata,
         "llm_reasoning": [f"[investigate_agent] {analysis.reasoning}"],
         "actions_taken": [
             f"[investigate_agent] {tool_calls_made} tool calls — "
@@ -127,6 +157,15 @@ def _build_initial_message(state: AlertTriageState) -> str:
         f"{json.dumps(context, indent=2)}\n\n"
         f"Write your investigation plan, then execute it."
     )
+
+
+def _extract_tool_results(messages: list, include_todos: bool = False) -> list[dict]:
+    """Extract tool outputs from a LangChain message list."""
+    return [
+        {"tool": m.name, "result": m.content}
+        for m in messages
+        if isinstance(m, ToolMessage) and (include_todos or m.name != "write_todos")
+    ]
 
 
 def _synthesise_rca(state: AlertTriageState, messages: list) -> RootCauseAnalysis:

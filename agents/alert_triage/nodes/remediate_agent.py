@@ -16,6 +16,7 @@ inject arbitrary resource IDs.
 """
 
 import json
+import os
 import time
 
 import structlog
@@ -28,6 +29,12 @@ from langchain_core.tools import tool
 from models.alert_state import AlertTriageState
 from tools.aws_boto import run_boto_sync
 from utils.llm import get_bedrock_llm
+from utils.token_usage import (
+    build_node_usage,
+    count_tool_calls_by_name,
+    extract_token_usage_from_messages,
+    merge_node_usage,
+)
 
 load_dotenv()
 
@@ -68,6 +75,7 @@ _NOT_FOUND_ERROR_HINTS = (
 def remediate_agent(state: AlertTriageState) -> dict:
     """ReAct remediation agent with TodoListMiddleware for structured multi-step execution."""
     alert_id = state["alert_id"]
+    fallback_model = os.environ.get("BEDROCK_MODEL_ID", "unknown").removeprefix("bedrock:")
     log.info("remediate_agent_started", alert_id=alert_id, service=state.get("service_type"))
 
     remediation_tools = _build_remediation_tools(state)
@@ -86,26 +94,49 @@ def remediate_agent(state: AlertTriageState) -> dict:
     try:
         result = agent.invoke({"messages": [HumanMessage(content=_build_initial_message(state))]})
         messages = result.get("messages", [])
-        tool_calls_made = sum(1 for m in messages if hasattr(m, "tool_calls") and m.tool_calls)
+        tool_calls_made, tool_calls_by_name = count_tool_calls_by_name(
+            _extract_tool_results(messages, include_todos=True)
+        )
+        input_tokens, output_tokens, total_tokens, model_name = extract_token_usage_from_messages(
+            messages,
+            fallback_model_name=fallback_model,
+        )
+        node_usage = build_node_usage(
+            model_name=model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            tool_calls=tool_calls_made,
+            tool_calls_by_name=tool_calls_by_name,
+        )
         tool_results = _extract_tool_results(messages)
         resolved = _determine_resolved(tool_results)
         actions = _extract_actions_taken(tool_results)
         final_summary = _get_final_summary(messages)
 
         log.info("remediate_agent_complete", alert_id=alert_id,
-                 resolved=resolved, tool_calls=tool_calls_made)
+                 resolved=resolved, tool_calls=tool_calls_made,
+                 input_tokens=input_tokens, output_tokens=output_tokens, model_name=model_name)
     except Exception as e:
         log.error("remediate_agent_failed", alert_id=alert_id, error=str(e))
         resolved = False
         actions = [f"Agent error: {str(e)[:200]}"]
         tool_results = []
         final_summary = f"Remediation agent failed: {str(e)}"
+        node_usage = build_node_usage(model_name=fallback_model)
+
+    token_usage_metadata = merge_node_usage(
+        state.get("token_usage_metadata"),
+        "remediate_agent",
+        node_usage,
+    )
 
     return {
         "resolved": resolved,
         "can_remediate": True,
         "action_type": _summarise_action_type(tool_results),
         "remediation_results": tool_results,
+        "token_usage_metadata": token_usage_metadata,
         "actions_taken": [f"[remediate_agent] {a}" for a in actions],
         "llm_reasoning": [f"[remediate_agent] {final_summary[:500]}"],
     }
@@ -127,11 +158,11 @@ def _build_initial_message(state: AlertTriageState) -> str:
     )
 
 
-def _extract_tool_results(messages: list) -> list[dict]:
+def _extract_tool_results(messages: list, include_todos: bool = False) -> list[dict]:
     return [
         {"tool": m.name, "result": m.content}
         for m in messages
-        if isinstance(m, ToolMessage) and m.name != "write_todos"
+        if isinstance(m, ToolMessage) and (include_todos or m.name != "write_todos")
     ]
 
 

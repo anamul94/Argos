@@ -340,6 +340,77 @@ Resources:
                 }
               }
 
+  EC2StateChangeRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${AWS::StackName}-forward-ec2-state-change'
+      EventPattern:
+        source:
+          - "aws.ec2"
+        detail-type:
+          - "EC2 Instance State-change Notification"
+        detail:
+          state:
+            - "stopped"
+            - "terminated"
+          instance-id:
+            - !Ref EC2Instance
+      State: ENABLED
+      Targets:
+        - Id: 'EC2StateWebhookTarget'
+          Arn: !GetAtt WebhookDestination.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              account: "$.account"
+              id: "$.id"
+              instance_id: "$.detail.instance-id"
+              region: "$.region"
+              resources: "$.resources"
+              state: "$.detail.state"
+              time: "$.time"
+              version: "$.version"
+            InputTemplate:
+              Fn::Sub: |
+                {
+                  "version": <version>,
+                  "id": <id>,
+                  "detail-type": "CloudWatch Alarm State Change",
+                  "source": "aws.cloudwatch",
+                  "account": <account>,
+                  "time": <time>,
+                  "region": <region>,
+                  "resources": <resources>,
+                  "detail": {
+                    "alarmName": "p1-ec2-${AWS::StackName}-instance-state-change",
+                    "alarmArn": "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:p1-ec2-${AWS::StackName}-instance-state-change",
+                    "state": {
+                      "value": "ALARM",
+                      "reason": "EC2 instance entered stopped or terminated state",
+                      "timestamp": <time>
+                    },
+                    "configuration": {
+                      "metrics": [
+                        {
+                          "metricStat": {
+                            "metric": {
+                              "namespace": "AWS/EC2",
+                              "name": "InstanceState",
+                              "dimensions": {
+                                "InstanceId": <instance_id>
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "customMetadata": {
+                    "LogGroup": "/argos/ec2/web-server",
+                    "Origin": "EC2StateChangeRule"
+                  }
+                }
+
   # --------------------------------------------------------------------------
   # CloudWatch Alarms & Logs
   # --------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from agents.alert_triage.nodes.investigate_agent import investigate_agent
 from agents.alert_triage.nodes.notify import notify_and_report
 from agents.alert_triage.nodes.remediate_agent import remediate_agent
 from models.alert_state import AlertTriageState
+from utils.token_usage import empty_token_usage_metadata
 
 log = structlog.get_logger(__name__)
 
@@ -93,6 +94,7 @@ def build_initial_state(raw_payload: dict) -> dict:
     """
     return {
         "raw_payload": raw_payload,
+        "token_usage_metadata": empty_token_usage_metadata(),
         "llm_reasoning": [],
         "actions_taken": [],
         "node_errors": [],

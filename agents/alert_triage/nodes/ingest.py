@@ -10,6 +10,7 @@ import os
 import structlog
 
 from models.alert_state import AlertTriageState
+from utils.token_usage import build_node_usage, merge_node_usage
 
 log = structlog.get_logger(__name__)
 
@@ -33,6 +34,11 @@ def ingest_alert(state: AlertTriageState) -> dict:
     alarm_reason = detail.get("state", {}).get("reason", "")
 
     alert_id = _build_alert_id(account_id=account_id, alarm_name=alarm_name)
+    token_usage_metadata = merge_node_usage(
+        state.get("token_usage_metadata"),
+        "ingest_alert",
+        build_node_usage(model_name="none"),
+    )
 
     log.info("alert_ingested", alert_id=alert_id, alarm_name=alarm_name,
              account_id=account_id, region=region)
@@ -45,6 +51,7 @@ def ingest_alert(state: AlertTriageState) -> dict:
         "alarm_arn": alarm_arn,
         "alarm_reason": alarm_reason,
         "alarm_timestamp": alarm_timestamp,
+        "token_usage_metadata": token_usage_metadata,
         "actions_taken": [f"[ingest_alert] Ingested alarm '{alarm_name}' from account {account_id}"],
     }
 

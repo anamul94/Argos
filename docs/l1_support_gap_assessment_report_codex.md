@@ -13,6 +13,8 @@ Estimated current alignment: **30-40%** against the 7 high-level client requirem
 Update (March 11, 2026):
 - F2 (event normalization), F3 (dedup failure semantics), and F4 (ALARM-state filtering) have been implemented in code and validated.
 - Added incident-report signaling for missing/deleted resources plus CloudTrail event lookup support for investigation.
+- Added per-node token/tool usage metadata (ingest/classify/investigate/remediate/notify) with aggregated totals in incident report, Telegram, and SNS SMS; Jira payload intentionally unchanged.
+- Added EC2 manual stop/terminate detection path via EventBridge rule, transformed into ALARM payload shape for existing triage pipeline.
 
 ## 2. Scope and Review Method
 
@@ -270,3 +272,62 @@ Implemented enhancements:
 Operational answer:
 - Yes, it is possible to check logs/history of what happened to the resource.
 - This is done through CloudTrail management events (e.g., delete/terminate/stop actions).
+
+## 11. Token Usage Metadata Tracking (March 11, 2026)
+
+Implemented:
+- Added `token_usage_metadata` to runtime graph state.
+- Added per-node usage records with:
+  - `model_name`
+  - `input_tokens`
+  - `output_tokens`
+  - `total_tokens`
+  - `tool_calls`
+  - `tool_calls_by_name`
+  - `input_token_cost_usd`
+  - `output_token_cost_usd`
+  - `total_token_cost_usd`
+- Added aggregate totals:
+  - `totals.input_tokens`
+  - `totals.output_tokens`
+  - `totals.total_tokens`
+  - `totals.tool_calls`
+  - `totals.total_input_token_cost_usd`
+  - `totals.total_output_token_cost_usd`
+  - `totals.total_token_cost_usd`
+- Added pricing metadata:
+  - `pricing.input_per_1m_usd = 3.0`
+  - `pricing.output_per_1m_usd = 15.0`
+
+Notification/report behavior:
+- Included token usage metadata section in Telegram incident message.
+- Included token totals in SNS P1 SMS message.
+- Included full `token_usage_metadata` in final structured incident report.
+- Kept Jira issue payload unchanged (no token metadata added).
+
+Implementation evidence:
+- `utils/token_usage.py`
+- `agents/alert_triage/graph.py` (`build_initial_state`)
+- `models/alert_state.py`
+- `agents/alert_triage/nodes/ingest.py`
+- `agents/alert_triage/nodes/classify.py`
+- `agents/alert_triage/nodes/investigate_agent.py`
+- `agents/alert_triage/nodes/remediate_agent.py`
+- `agents/alert_triage/nodes/notify.py`
+
+## 12. EC2 Manual Stop Alarm Path (March 11, 2026)
+
+Implemented:
+- Added `EC2StateChangeRule` in `infra/ec2-monitoring-stack.yaml`:
+  - Matches `source=aws.ec2`
+  - `detail-type=EC2 Instance State-change Notification`
+  - States: `stopped`, `terminated`
+  - Instance filter: target stack EC2 instance
+- Uses EventBridge input transformer to emit a synthetic:
+  - `source=aws.cloudwatch`
+  - `detail-type=CloudWatch Alarm State Change`
+  - `detail.state.value=ALARM`
+  - EC2 `InstanceId` in dimensions
+
+Outcome:
+- Manual EC2 stop/terminate now enters the same Argos ALARM triage flow and triggers incident handling.

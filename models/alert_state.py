@@ -19,6 +19,7 @@ class AlertTriageState(TypedDict):
     alarm_reason: str
     alarm_timestamp: str
     metadata: dict
+    token_usage_metadata: dict
 
     # ── Classification (populated by classify_alert) ──────────────────────────
     severity: str                    # "p1" | "p2" | "p3" | "p4"
