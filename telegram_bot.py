@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from langchain.agents import create_agent
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import InMemorySaver
+from utils.llm import get_llm
 
 load_dotenv()
 app = FastAPI()
@@ -303,7 +304,7 @@ aws_boto_command_tool = StructuredTool.from_function(
 # ── Agent ────────────────────────────────────────────────────────────────────
 
 aws_boto_agent = create_agent(
-    model="bedrock:global.anthropic.claude-sonnet-4-6",
+    model=get_llm(),
     tools=[aws_boto_command_tool],
     system_prompt=(
         "You are an AWS expert who can help users query and manage their AWS resources "

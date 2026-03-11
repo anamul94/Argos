@@ -14,7 +14,6 @@ All tools are read-only AWS operations — no writes happen here.
 """
 
 import json
-import os
 import time
 
 import structlog
@@ -27,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from models.alert_state import AlertTriageState
 from tools.aws_boto import run_boto_sync
-from utils.llm import get_bedrock_llm
+from utils.llm import get_active_model_name, get_bedrock_llm
 from utils.token_usage import (
     build_node_usage,
     count_tool_calls_by_name,
@@ -69,7 +68,7 @@ def investigate_agent(state: AlertTriageState) -> dict:
     """ReAct investigation agent with TodoListMiddleware for structured planning."""
     alert_id = state["alert_id"]
     region = state["region"]
-    fallback_model = os.environ.get("BEDROCK_MODEL_ID", "unknown").removeprefix("bedrock:")
+    fallback_model = get_active_model_name()
     log.info("investigate_agent_started", alert_id=alert_id, service=state["service_type"])
 
     investigation_tools = _build_investigation_tools(region)

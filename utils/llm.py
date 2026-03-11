@@ -1,69 +1,145 @@
-"""Central LLM factory — builds a ChatBedrock instance with explicit credentials.
+"""Central LLM factory with provider switching (Ollama or Bedrock).
 
-Reads credentials from environment at call time so they are always fresh.
-Separates BEDROCK_REGION from AWS_DEFAULT_REGION because Bedrock is often
-enabled in a different region than the workload (e.g. us-east-1 while
-infra runs in ap-south-1).
+Uses langchain.chat_models.init_chat_model so model/provider configuration
+is centralized and easy to switch through environment variables.
 """
 
 import os
 
 import structlog
 from dotenv import load_dotenv
-from langchain_aws import ChatBedrock
+from langchain.chat_models import init_chat_model
 
 load_dotenv()
 
 log = structlog.get_logger(__name__)
 
-# Default model — override with BEDROCK_MODEL_ID env var.
-# Accepts both the langchain "bedrock:..." prefix format and the raw model ID.
-# Examples:
-#   bedrock:global.anthropic.claude-sonnet-4-6      (cross-region, all regions)
-#   global.anthropic.claude-sonnet-4-6              (same, no prefix)
-#   anthropic.claude-3-5-sonnet-20241022-v2:0       (single region)
-_DEFAULT_MODEL_ID = "bedrock:global.anthropic.claude-sonnet-4-6"
+_DEFAULT_PROVIDER = "ollama"
+_DEFAULT_BEDROCK_MODEL_ID = "bedrock:global.anthropic.claude-sonnet-4-6"
+_DEFAULT_OLLAMA_MODEL = "glm-4.7-flash:latest"
+_DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+_KNOWN_PROVIDER_PREFIXES = {
+    "anthropic",
+    "azure_openai",
+    "bedrock",
+    "cohere",
+    "google_genai",
+    "groq",
+    "mistralai",
+    "ollama",
+    "openai",
+    "together",
+}
+
+
+def get_active_llm_provider() -> str:
+    """Return active provider name: 'ollama' or 'bedrock'."""
+    provider = os.environ.get("LLM_PROVIDER", _DEFAULT_PROVIDER).strip().lower()
+    if provider not in {"ollama", "bedrock"}:
+        log.warning("invalid_llm_provider_fallback", provider=provider, fallback=_DEFAULT_PROVIDER)
+        return _DEFAULT_PROVIDER
+    return provider
+
+
+def get_active_model_name() -> str:
+    """Return the active model name without provider prefix."""
+    return _strip_provider_prefix(get_active_model_ref())
+
+
+def get_active_model_ref() -> str:
+    """Return provider-prefixed model reference for init_chat_model.
+
+    Examples:
+      - ollama:glm-4.7-flash:latest
+      - bedrock:global.anthropic.claude-sonnet-4-6
+    """
+    provider = get_active_llm_provider()
+    explicit = os.environ.get("LLM_MODEL", "").strip()
+    if explicit:
+        return _with_provider_prefix(explicit, provider)
+
+    if provider == "ollama":
+        raw = os.environ.get("OLLAMA_MODEL", _DEFAULT_OLLAMA_MODEL).strip() or _DEFAULT_OLLAMA_MODEL
+        return _with_provider_prefix(raw, "ollama")
+
+    raw = os.environ.get("BEDROCK_MODEL_ID", _DEFAULT_BEDROCK_MODEL_ID).strip() or _DEFAULT_BEDROCK_MODEL_ID
+    return _with_provider_prefix(raw, "bedrock")
+
+
+def get_llm(structured_output_schema=None):
+    """Build the active LLM (Ollama or Bedrock) with optional structured output."""
+    provider = get_active_llm_provider()
+    model_ref = get_active_model_ref()
+    kwargs = _provider_kwargs(provider)
+    llm = init_chat_model(model_ref, **kwargs)
+
+    if structured_output_schema is not None:
+        return llm.with_structured_output(structured_output_schema)
+    return llm
 
 
 def get_bedrock_llm(structured_output_schema=None):
-    """Build a ChatBedrock instance with credentials loaded from environment.
+    """Backward-compatible alias used across existing nodes.
 
-    Passes AWS credentials explicitly so they are picked up correctly in
-    background threads where the boto3 credential chain may not find .env vars.
-    Strips the 'bedrock:' prefix if present — ChatBedrock takes the raw model ID.
-
-    Args:
-        structured_output_schema: Optional Pydantic model class. When provided,
-            returns llm.with_structured_output(schema).
-
-    Returns:
-        Configured ChatBedrock instance (or structured output wrapper).
+    Despite the historical function name, this now returns whichever provider
+    is active in `LLM_PROVIDER`.
     """
-    raw = os.environ.get("BEDROCK_MODEL_ID", _DEFAULT_MODEL_ID)
-    # ChatBedrock takes the model ID without the "bedrock:" provider prefix
-    model_id = raw.removeprefix("bedrock:")
+    return get_llm(structured_output_schema=structured_output_schema)
+
+
+def _provider_kwargs(provider: str) -> dict:
+    """Build provider-specific kwargs for init_chat_model."""
+    temperature = float(os.environ.get("LLM_TEMPERATURE", "0"))
+    kwargs: dict = {"temperature": temperature}
+    model_ref = get_active_model_ref()
+
+    if provider == "ollama":
+        # Ensures ollama integration package is present.
+        try:
+            import langchain_ollama  # noqa: F401
+        except Exception as e:
+            raise RuntimeError(
+                "Ollama provider selected but langchain-ollama is not installed. "
+                "Install it with: pip install langchain-ollama"
+            ) from e
+        base_url = os.environ.get("OLLAMA_BASE_URL", _DEFAULT_OLLAMA_BASE_URL).strip() or _DEFAULT_OLLAMA_BASE_URL
+        kwargs["base_url"] = base_url
+        log.debug("llm_init", provider=provider, model=model_ref, base_url=base_url, temperature=temperature)
+        return kwargs
+
+    # Bedrock provider kwargs (keeps existing AWS behavior)
     region = os.environ.get("BEDROCK_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
     access_key = os.environ.get("AWS_ACCESS_KEY_ID")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
-    session_token = os.environ.get("AWS_SESSION_TOKEN")  # needed for temporary credentials
-
-    log.debug("bedrock_llm_init", model_id=model_id, region=region, has_key=bool(access_key))
-
-    kwargs = {
-        "model_id": model_id,
-        "region_name": region,
-        "model_kwargs": {"max_tokens": 2048},
-    }
-
-    # Only pass explicit credentials if present — allows IAM role auth when keys absent
+    session_token = os.environ.get("AWS_SESSION_TOKEN")
+    kwargs["region_name"] = region
+    kwargs["model_kwargs"] = {"max_tokens": 2048}
     if access_key and secret_key:
         kwargs["aws_access_key_id"] = access_key
         kwargs["aws_secret_access_key"] = secret_key
         if session_token:
             kwargs["aws_session_token"] = session_token
+    log.debug("llm_init", provider=provider, model=model_ref, region=region, has_key=bool(access_key))
+    return kwargs
 
-    llm = ChatBedrock(**kwargs)
 
-    if structured_output_schema is not None:
-        return llm.with_structured_output(structured_output_schema)
-    return llm
+def _with_provider_prefix(model: str, provider: str) -> str:
+    """Ensure model has provider prefix unless it already has any known prefix."""
+    raw = model.strip()
+    if not raw:
+        return raw
+    if ":" in raw:
+        prefix = raw.split(":", 1)[0].lower()
+        if prefix in _KNOWN_PROVIDER_PREFIXES:
+            return raw
+    return f"{provider}:{raw}"
+
+
+def _strip_provider_prefix(model_ref: str) -> str:
+    """Strip known provider prefix from model ref for display/metadata."""
+    if ":" not in model_ref:
+        return model_ref
+    prefix, rest = model_ref.split(":", 1)
+    if prefix.lower() in _KNOWN_PROVIDER_PREFIXES:
+        return rest
+    return model_ref

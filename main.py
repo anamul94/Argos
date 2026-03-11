@@ -22,6 +22,7 @@ from agents.alert_triage.graph import (
 )
 from tools.aws_boto import aws_boto_command_tool
 from utils.formatting import markdown_to_telegram_html
+from utils.llm import get_llm
 
 load_dotenv()
 
@@ -34,7 +35,7 @@ app = FastAPI(title="Argos", version="1.0.0")
 # ── Telegram interactive agent ────────────────────────────────────────────────
 
 _telegram_agent = create_agent(
-    model=os.environ.get("BEDROCK_MODEL_ID", "bedrock:global.anthropic.claude-sonnet-4-6"),
+    model=get_llm(),
     tools=[aws_boto_command_tool],
     system_prompt=(
         "You are an AWS expert who can help users query and manage their AWS resources "

@@ -324,7 +324,18 @@ Create a `.env` file in the project root:
 # AWS — use IAM role in Lambda/EC2, or set credentials for local dev
 AWS_DEFAULT_REGION=ap-south-1
 
-# Bedrock
+# LLM provider switch (centralized in utils/llm.py)
+# Use Ollama now; switch to bedrock later by changing only this value.
+LLM_PROVIDER=ollama
+
+# Optional global override for model name across providers
+# LLM_MODEL=glm-4.7-flash:latest
+
+# Ollama (default active provider)
+OLLAMA_MODEL=glm-4.7-flash:latest
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+
+# Bedrock (kept as-is for later switch-back)
 BEDROCK_MODEL_ID=bedrock:global.anthropic.claude-sonnet-4-6
 
 # Telegram

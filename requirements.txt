@@ -8,6 +8,7 @@ pydantic
 structlog
 langchain
 langchain-aws
+langchain-ollama
 langchain-core
 langgraph
 langgraph-dynamodb-checkpoint
