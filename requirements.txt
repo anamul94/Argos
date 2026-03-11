@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-dotenv
+httpx
+boto3
+botocore
+pydantic
+structlog
+langchain
+langchain-aws
+langchain-core
+langgraph
+langgraph-dynamodb-checkpoint
+tenacity
