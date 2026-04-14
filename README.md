@@ -2,7 +2,7 @@
 
 AI-powered cloud operations agent for AWS L1/L2 operations. Receives CloudWatch alarms, investigates root causes, auto-remediates safely, creates Jira tickets, and notifies teams via Telegram and SMS — all autonomously.
 
-Built on **LangGraph** + **Amazon Bedrock (Claude)** + **FastAPI**.
+Built on **LangChain Deep Agents** + **Amazon Bedrock (Claude)** + **FastAPI**.
 
 ---
 
@@ -38,7 +38,7 @@ Argos connects to your AWS environment and responds to CloudWatch alarms automat
 7. Creates a Jira incident ticket and sends a full report to Telegram
 8. Sends an SMS to on-call if P1
 
-Everything is recorded in an immutable audit trail inside the LangGraph checkpoint store.
+Everything is recorded in an immutable audit trail inside the alert triage checkpoint store.
 
 ---
 
@@ -64,12 +64,11 @@ Everything is recorded in an immutable audit trail inside the LangGraph checkpoi
                                                  │ background task
                                                  ▼
                                     ┌──────────────────────────┐
-                                    │   Alert Triage LangGraph  │
+                                    │  Alert Triage Deep Agent  │
                                     │                           │
                                     │  ingest_alert        →    │
                                     │  classify_alert      →    │
-                                    │  investigate_agent   →    │
-                                    │  remediate_agent     →    │
+                                    │  one Deep Agent loop →    │
                                     │  notify_and_report        │
                                     └────────────┬─────────────┘
                                                  │
@@ -86,7 +85,7 @@ Everything is recorded in an immutable audit trail inside the LangGraph checkpoi
 
 | Route | Trigger | Handler |
 |---|---|---|
-| `POST /alert-webhook` | EventBridge CloudWatch alarm | Alert Triage LangGraph (background) |
+| `POST /alert-webhook` | EventBridge CloudWatch alarm | Alert Triage Deep Agent (background) |
 | `POST /telegram-webhook` | Telegram user message | Interactive LangChain agent |
 
 The Telegram bot is a conversational AWS assistant (ask questions, query resources). The alert webhook is the autonomous remediation pipeline.
@@ -95,7 +94,7 @@ The Telegram bot is a conversational AWS assistant (ask questions, query resourc
 
 ## Alert Triage Agent
 
-### Graph Flow
+### Agent Flow
 
 ```
                     ┌─────────────┐
@@ -107,13 +106,8 @@ The Telegram bot is a conversational AWS assistant (ask questions, query resourc
                     └──────┬──────┘  service_type from metric namespace
                            │
                     ┌──────▼─────────────────┐
-                    │ investigate_agent      │  ReAct agent: fetches metrics, 
-                    │ (TodoListMiddleware)   │  searches logs, synthesises RCA
-                    └──────┬─────────────────┘
-                           │
-                    ┌──────▼─────────────────┐
-                    │ remediate_agent        │  ReAct agent: plans remediation, 
-                    │ (TodoListMiddleware)   │  executes action, verifies health
+                    │ alert_triage_agent     │  Deep Agent: investigates,
+                    │ (single tool loop)     │  remediates, verifies, records RCA
                     └──────┬─────────────────┘
                            │
                     ┌──────▼─────────────────┐
@@ -127,8 +121,7 @@ The Telegram bot is a conversational AWS assistant (ask questions, query resourc
 |---|---|---|
 | `ingest_alert` | Pure Python | Normalise EventBridge/SQS payload. Generate `alert_id`. |
 | `classify_alert` | Pure Python | Parse `severity` from alarm name prefix. Map metric namespace to `service_type`. |
-| `investigate_agent` | **ReAct Agent (Bedrock)** | Uses read-only AWS tools dynamically to find root cause. Outputs `root_cause`, `confidence`, `contributing_factors`, `reasoning`. |
-| `remediate_agent` | **ReAct Agent (Bedrock)** | Formulates a remediation plan and attempts execution using safe AWS write tools. Verifies recovery via health checks. |
+| `alert_triage_agent` | **Deep Agent (LangChain)** | Uses AWS investigation and remediation tools in one loop, then records the final RCA and resolution state. |
 | `notify_and_report` | Pure Python + HTTP | Creates Jira ticket, sends Telegram summary, sends SMS if P1. |
 
 ### State Model
@@ -173,14 +166,14 @@ class AlertTriageState(TypedDict):
     jira_issue_key: str
     report: dict
 
-    # Append-only audit trail (LangGraph reducer: list concat)
+    # Append-only audit trail
     llm_reasoning:        Annotated[list[str], operator.add]
     actions_taken:        Annotated[list[str], operator.add]
     node_errors:          Annotated[list[str], operator.add]
     remediation_results:  Annotated[list[dict], operator.add]
 ```
 
-**Append-only fields** (`llm_reasoning`, `actions_taken`, `node_errors`, `remediation_results`) use LangGraph's `operator.add` reducer — nodes only append, never overwrite. This creates a tamper-evident log of everything the agent did.
+**Append-only fields** (`llm_reasoning`, `actions_taken`, `node_errors`, `remediation_results`) are merged append-only by the alert triage runner so each node adds evidence without overwriting prior steps.
 
 ### Thread Isolation
 
@@ -289,7 +282,8 @@ argos/
 │
 └── agents/
     └── alert_triage/
-        ├── graph.py                     Compiled LangGraph, thread_id helpers, checkpointer
+        ├── agent.py                     Deep Agent runner, thread_id helpers, checkpointer
+        ├── graph.py                     Backward-compatible import shim
         └── nodes/
             ├── ingest.py
             ├── classify.py

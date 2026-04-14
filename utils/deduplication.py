@@ -162,7 +162,8 @@ def _key_exists(table, dedup_key: str) -> bool:
     """Return True if the dedup_key exists and has not expired."""
     response = table.get_item(
         Key={"dedup_key": dedup_key},
-        ProjectionExpression="dedup_key, ttl",
+        ProjectionExpression="dedup_key, #ttl",
+        ExpressionAttributeNames={"#ttl": "ttl"},
     )
     item = response.get("Item")
     if not item:

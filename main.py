@@ -2,7 +2,7 @@
 
 Routes:
   POST /telegram-webhook    Interactive AWS assistant (existing Telegram bot)
-  POST /alert-webhook       EventBridge CloudWatch alarm → alert triage graph
+  POST /alert-webhook       EventBridge CloudWatch alarm → alert triage agent
 """
 
 import asyncio
@@ -15,11 +15,7 @@ from fastapi.background import BackgroundTasks
 from langchain.agents import create_agent
 from langgraph.checkpoint.memory import MemorySaver
 
-from agents.alert_triage.graph import (
-    alert_triage_graph,
-    build_initial_state,
-    build_thread_config,
-)
+from agents.alert_triage.agent import alert_triage_agent, build_initial_state, build_thread_config
 from tools.aws_boto import aws_boto_command_tool
 from utils.formatting import markdown_to_telegram_html
 from utils.llm import get_llm
@@ -86,7 +82,7 @@ async def telegram_webhook(req: Request) -> dict:
 
 @app.post("/alert-webhook")
 async def alert_webhook(req: Request, background_tasks: BackgroundTasks) -> dict:
-    """Receive EventBridge CloudWatch alarm events and trigger the triage graph.
+    """Receive EventBridge CloudWatch alarm events and trigger the triage agent.
 
     Returns 200 immediately. Triage runs as a background task so the
     API Gateway / EventBridge HTTP target does not time out.
@@ -177,9 +173,10 @@ def _is_cloudwatch_alarm_event(event: dict) -> bool:
 
 
 def _run_triage(event: dict) -> None:
-    """Invoke the alert triage graph synchronously (runs in background thread)."""
+    """Invoke the alert triage agent synchronously (runs in background thread)."""
     import time
     from utils.deduplication import DuplicateAlertError, is_duplicate, mark_completed, mark_processing
+    from tools.telegram_notify import send_ops_alert
 
     detail = event.get("detail", {})
     account_id = event.get("account", "unknown")
@@ -198,15 +195,26 @@ def _run_triage(event: dict) -> None:
         log.warning("alert_claimed_by_other_instance", alert_id=alert_id, alarm_name=alarm_name)
         return
 
-    # ── Run graph ─────────────────────────────────────────────────────────────
+    # ── Run alert triage agent ────────────────────────────────────────────────
     config = build_thread_config(account_id=account_id, alert_id=alert_id)
     initial_state = build_initial_state(raw_payload=event)
 
-    log.info("triage_graph_starting", alert_id=alert_id, alarm_name=alarm_name)
+    log.info("triage_agent_starting", alert_id=alert_id, alarm_name=alarm_name)
+    send_ops_alert(
+        text=(
+            f"**ARGOS ALERT RECEIVED**\n"
+            f"`WORKING | {alarm_name}`\n\n"
+            f"`Account : {account_id}`\n"
+            f"`Region  : {event.get('region', 'unknown')}`\n"
+            f"`Alert ID: {alert_id}`\n\n"
+            f"Argos received this alarm and started triage."
+        ),
+        alert_id=alert_id,
+    )
     try:
-        result = alert_triage_graph.invoke(initial_state, config=config)
+        result = alert_triage_agent.invoke(initial_state, config=config)
         log.info(
-            "triage_graph_complete",
+            "triage_agent_complete",
             alert_id=alert_id,
             resolved=result.get("resolved", False),
             jira_key=result.get("jira_issue_key"),
@@ -214,7 +222,7 @@ def _run_triage(event: dict) -> None:
         )
         mark_completed(alarm_arn=alarm_arn, alert_id=alert_id)
     except Exception as e:
-        log.error("triage_graph_failed", alert_id=alert_id, alarm_name=alarm_name, error=str(e))
+        log.error("triage_agent_failed", alert_id=alert_id, alarm_name=alarm_name, error=str(e))
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

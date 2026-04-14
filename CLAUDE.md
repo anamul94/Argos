@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (`claude.ai/code`) when working with 
 ## Repository Purpose
 
 **Argos** — An AI-powered cloud operations agent for AWS L1/L2 operations.
-Built on LangGraph and Amazon Bedrock. Receives CloudWatch alarms via EventBridge, investigates root causes, auto-remediates safely, creates Jira tickets, and notifies via Telegram and SMS.
+Built on LangChain Deep Agents and Amazon Bedrock. Receives CloudWatch alarms via EventBridge, investigates root causes, auto-remediates safely, creates Jira tickets, and notifies via Telegram and SMS.
 
 ## Running
 
@@ -54,7 +54,8 @@ tools/
   sns_notify.py                     # SNS SMS for P1 on-call alerts
   telegram_notify.py                # Telegram ops channel notifications
 agents/alert_triage/
-  graph.py                          # Compiled LangGraph + thread ID helpers
+  agent.py                          # Deep Agent runner + thread ID helpers
+  graph.py                          # Backward-compatible import shim
   nodes/
     ingest.py                       # Normalise EventBridge payload
     classify.py                     # Extract severity (alarm prefix) + service type (namespace)
@@ -67,23 +68,22 @@ agents/alert_triage/
 
 ---
 
-## Alert Triage Graph Flow
+## Alert Triage Agent Flow
 
 ```
 EventBridge (CloudWatch Alarm state=ALARM)
   → POST /alert-webhook  (returns 200 immediately, runs triage in background)
     → ingest_alert       normalise payload, generate alert_id
     → classify_alert     severity from alarm name prefix, service_type from namespace
-    → investigate_agent  ReAct agent (TodoListMiddleware) runs read-only AWS tools (logs, metrics, health) and creates RootCauseAnalysis
-    → remediate_agent    ReAct agent (TodoListMiddleware) plans remediation, runs safe AWS actions from menu, verifies health
+    → alert_triage_agent one Deep Agent uses AWS investigation/remediation tools, verifies health, and records the final RCA
     → notify_and_report  Jira ticket + Telegram ops channel + SNS SMS (P1 only)
 ```
 
 **Thread isolation:** `thread_id = f"{account_id}#{alert_id}"` — each alarm firing gets a unique ID, concurrent alerts never mix state.
 
-**Safe remediation only (v1):** `force_ecs_redeploy`, `scale_out_ecs` (+2 tasks, cap 10), `reboot_ec2`, `reboot_rds`, `scale_out_asg` (+2). No scale-down, no terminate, no delete.
+**Safe remediation only (v1):** `force_ecs_redeploy`, `scale_out_ecs` (+2 tasks, cap 10), `start_ec2_instance`, `reboot_ec2`, `reboot_rds`, `scale_out_asg` (+2). No scale-down, no terminate, no delete.
 
-**LLM never touches resource IDs:** `remediate_agent` LLM picks an action type tool. The tools resolve resource IDs exclusively from `state["dimensions"]` (verified AWS data).
+**LLM never touches resource IDs:** the Deep Agent selects safe tools only. Those tools resolve resource IDs exclusively from `state["dimensions"]` and prefetched AWS health data.
 
 ## AWS Service Routing
 
@@ -112,7 +112,7 @@ Severity is parsed from the prefix. Missing prefix defaults to `p3`.
 
 | Route | Purpose |
 |---|---|
-| `POST /alert-webhook` | EventBridge CloudWatch alarm → triage graph (background task) |
+| `POST /alert-webhook` | EventBridge CloudWatch alarm → triage agent (background task) |
 | `POST /telegram-webhook` or `POST /` | Interactive Telegram bot (existing) |
 | `GET /health` | Health check |
 

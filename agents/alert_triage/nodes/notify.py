@@ -47,9 +47,10 @@ def notify_and_report(state: AlertTriageState) -> dict:
 
     jira_result = _create_ticket(state)
     jira_key = jira_result.get("issue_key")
+    jira_attempted = jira_result.get("attempted", False)
 
     notify_tool_calls_by_name = {
-        "create_jira_issue": 1,
+        "create_jira_issue": 1 if jira_attempted else 0,
         "send_ops_alert": 1,
         "send_sms": 1 if severity.lower() == "p1" else 0,
     }
@@ -79,7 +80,8 @@ def notify_and_report(state: AlertTriageState) -> dict:
         "token_usage_metadata": token_usage_metadata,
         "report": report,
         "actions_taken": [
-            f"[notify_and_report] Jira: {jira_key or 'failed'} | "
+            f"[notify_and_report] Jira: "
+            f"{jira_key if jira_key else ('skipped' if not jira_attempted else 'failed')} | "
             f"Telegram: {telegram_result.get('status')} | "
             f"SMS: {'sent' if sms_result else 'skipped'}"
         ],
@@ -88,8 +90,12 @@ def notify_and_report(state: AlertTriageState) -> dict:
 
 def _create_ticket(state: AlertTriageState) -> dict:
     """Create a Jira incident ticket from alert state. Returns result dict."""
+    if state.get("resolved", False):
+        log.info("notify_jira_skipped_resolved", alert_id=state["alert_id"])
+        return {"status": "skipped", "attempted": False}
+
     try:
-        return create_jira_issue(
+        result = create_jira_issue(
             alert_id=state["alert_id"],
             alarm_name=state["alarm_name"],
             severity=state.get("severity", "p3"),
@@ -101,9 +107,11 @@ def _create_ticket(state: AlertTriageState) -> dict:
             account_id=state["account_id"],
             region=state["region"],
         )
+        result["attempted"] = True
+        return result
     except Exception as e:
         log.error("notify_jira_failed", alert_id=state["alert_id"], error=str(e))
-        return {"status": "error", "error": str(e)}
+        return {"status": "error", "error": str(e), "attempted": True}
 
 
 def _send_telegram(state: AlertTriageState, jira_key: str | None, token_usage_metadata: dict) -> dict:
@@ -153,6 +161,7 @@ def _build_telegram_message(state: AlertTriageState, jira_key: str | None, token
 
     raw_actions = state.get("actions_taken", [])[-4:]
     actions = "\n".join(f"- {_limit_line(_clean_action_text(str(a)), 160)}" for a in raw_actions) or "- None"
+    tool_outputs = _build_tool_outputs_markdown(state.get("tool_outputs", []))
     jira_display = jira_key if jira_key else "not created"
     auto_status = "yes" if state.get("resolved") else "no"
     resource_issue = _detect_resource_missing_or_deleted(state)
@@ -180,6 +189,7 @@ def _build_telegram_message(state: AlertTriageState, jira_key: str | None, token
         body += f"**Resource Status Note**\n{resource_note}\n\n"
     body += (
         f"**Actions Taken by Argos**\n{actions}\n\n"
+        f"**Tool Outputs**\n{tool_outputs}\n\n"
         f"**Contributing Factors**\n{factors}\n\n"
         f"**Token Usage Metadata**\n{_build_token_usage_markdown(token_usage_metadata)}\n\n"
         f"---\n"
@@ -222,10 +232,25 @@ def _build_report(state: AlertTriageState, jira_key: str | None, token_usage_met
         "jira_issue_key": jira_key,
         "actions_taken": state.get("actions_taken", []),
         "node_errors": state.get("node_errors", []),
+        "tool_outputs": state.get("tool_outputs", []),
         "token_usage_metadata": token_usage_metadata,
         "resource_missing_or_deleted": resource_issue,
         "resource_issue_evidence": resource_evidence,
     }
+
+
+def _build_tool_outputs_markdown(tool_outputs: list[dict]) -> str:
+    """Render the last few tool outputs in a Telegram-friendly compact format."""
+    if not isinstance(tool_outputs, list) or not tool_outputs:
+        return "- No tool outputs captured"
+
+    lines = []
+    for item in tool_outputs[-5:]:
+        tool_name = _limit_line(str(item.get("tool", "unknown")), 40)
+        raw_result = str(item.get("result", ""))
+        clean_result = " ".join(raw_result.split())
+        lines.append(f"- `{tool_name}`: {_limit_line(clean_result, 220)}")
+    return "\n".join(lines)
 
 
 def _build_token_usage_markdown(token_usage_metadata: dict) -> str:

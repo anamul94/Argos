@@ -8,6 +8,7 @@
 #   bash test_payloads.sh lambda_errors
 #   bash test_payloads.sh alb_5xx
 #   bash test_payloads.sh ec2_cpu
+#   bash test_payloads.sh ec2_instance_down
 
 BASE_URL="${ARGOS_URL:-http://localhost:8080}"
 SCENARIO="${1:-ecs_cpu}"
@@ -302,6 +303,58 @@ cat <<'EOF'
 EOF
 }
 
+payload_ec2_instance_down() {
+cat <<'EOF'
+{
+  "version": "0",
+  "id": "9b14f3e2-8f33-4cb1-9a01-ec2status0001",
+  "source": "aws.cloudwatch",
+  "detail-type": "CloudWatch Alarm State Change",
+  "account": "686255973607",
+  "time": "2026-04-14T12:19:48Z",
+  "region": "ap-south-1",
+  "customMetadata": {
+    "LogGroup": "/argos/ec2/web-server"
+  },
+  "detail": {
+    "alarmName": "p1-ec2-argos-instance-down",
+    "alarmArn": "arn:aws:cloudwatch:ap-south-1:686255973607:alarm:p1-ec2-argos-instance-down",
+    "state": {
+      "value": "ALARM",
+      "reason": "Threshold Crossed: 1 datapoint [1.0] was greater than or equal to the threshold (1.0).",
+      "reasonData": "{\"version\":\"1.0\",\"queryDate\":\"2026-04-14T12:19:48.000+0000\",\"statistic\":\"Maximum\",\"period\":60,\"recentDatapoints\":[1.0],\"threshold\":1.0}",
+      "timestamp": "2026-04-14T12:19:48.000+0000"
+    },
+    "previousState": {
+      "value": "OK",
+      "reason": "Threshold Crossed: no datapoints were received for 1 period and 1 missing datapoint was treated as [NonBreaching].",
+      "timestamp": "2026-04-14T12:18:48.000+0000"
+    },
+    "configuration": {
+      "description": "EC2 StatusCheckFailed >= 1",
+      "metrics": [
+        {
+          "id": "m1",
+          "metricStat": {
+            "metric": {
+              "namespace": "AWS/EC2",
+              "name": "StatusCheckFailed",
+              "dimensions": {
+                "InstanceId": "i-075c52176fa1d8e8c"
+              }
+            },
+            "period": 60,
+            "stat": "Maximum"
+          },
+          "returnData": true
+        }
+      ]
+    }
+  }
+}
+EOF
+}
+
 # ── Send ──────────────────────────────────────────────────────────────────────
 
 echo "Sending scenario: ${SCENARIO}"
@@ -315,9 +368,10 @@ case "$SCENARIO" in
   lambda_errors)   PAYLOAD=$(payload_lambda_errors) ;;
   alb_5xx)         PAYLOAD=$(payload_alb_5xx) ;;
   ec2_cpu)         PAYLOAD=$(payload_ec2_cpu) ;;
+  ec2_instance_down) PAYLOAD=$(payload_ec2_instance_down) ;;
   *)
     echo "Unknown scenario: ${SCENARIO}"
-    echo "Available: ecs_cpu, ecs_memory, rds_connections, lambda_errors, alb_5xx, ec2_cpu"
+    echo "Available: ecs_cpu, ecs_memory, rds_connections, lambda_errors, alb_5xx, ec2_cpu, ec2_instance_down"
     exit 1
     ;;
 esac
