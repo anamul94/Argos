@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:aws.amazon.com)",
+      "Bash(source venv/bin/activate && python test_jira.py 2>&1)",
+      "Bash(source venv/bin/activate && python -c \"\nfrom dotenv import load_dotenv; load_dotenv\\(\\)\nimport os, httpx\nbase = os.environ['JIRA_BASE_URL'].rstrip\\('/'\\)\nauth = \\(os.environ['JIRA_EMAIL'], os.environ['JIRA_API_TOKEN']\\)\nr = httpx.get\\(f'{base}/rest/api/3/issue/createmeta?projectKeys={os.environ[\\\\\"JIRA_PROJECT_KEY\\\\\"]}&expand=projects.issuetypes', auth=auth, timeout=10\\)\ntypes = r.json\\(\\).get\\('projects', [{}]\\)[0].get\\('issuetypes', []\\)\nfor t in types:\n    print\\(t['name']\\)\n\" 2>&1)",
+      "Bash(source venv/bin/activate && python -c \"\nfrom langchain.agents import create_agent\nimport inspect\nprint\\(inspect.getdoc\\(create_agent\\)[:1200]\\)\nprint\\(\\)\nprint\\('PARAMS:', list\\(inspect.signature\\(create_agent\\).parameters.keys\\(\\)\\)\\)\n\" 2>&1)",
+      "Bash(source venv/bin/activate && python -c \"\nimport langchain.middleware as mw\nprint\\(dir\\(mw\\)\\)\n\" 2>&1 && source venv/bin/activate && python -c \"\nfrom langchain.middleware import SummaryMiddleware\nimport inspect\nprint\\(inspect.getdoc\\(SummaryMiddleware\\)[:500]\\)\n\" 2>&1)",
+      "Bash(source venv/bin/activate && python -c \"\nfrom langchain.agents.middleware.todo import TodoMiddleware\nimport inspect\nprint\\(inspect.getdoc\\(TodoMiddleware\\)[:1500]\\)\nprint\\(\\)\nprint\\('PARAMS:', list\\(inspect.signature\\(TodoMiddleware.__init__\\).parameters.keys\\(\\)\\)\\)\n\" 2>&1)",
+      "WebFetch(domain:docs.langchain.com)",
+      "Bash(source venv/bin/activate && python -c \"\nfrom langchain.agents.middleware import TodoListMiddleware, ToolCallLimitMiddleware\nimport inspect\nprint\\('=== TodoListMiddleware ==='\\)\nprint\\(inspect.signature\\(TodoListMiddleware.__init__\\)\\)\nprint\\(\\)\nprint\\('=== ToolCallLimitMiddleware ==='\\)\nprint\\(inspect.signature\\(ToolCallLimitMiddleware.__init__\\)\\)\n\" 2>&1)",
+      "Bash(source venv/bin/activate && python -c \"\nfrom agents.alert_triage.nodes.investigate_agent import investigate_agent\nfrom agents.alert_triage.nodes.remediate_agent import remediate_agent\nfrom agents.alert_triage.graph import alert_triage_graph\nprint\\('All imports OK'\\)\nprint\\('Graph nodes:', list\\(alert_triage_graph.nodes.keys\\(\\)\\)\\)\n\" 2>&1)"
+    ]
+  }
+}
